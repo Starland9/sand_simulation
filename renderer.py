@@ -23,6 +23,7 @@ layout(location = 2) in float size;
 
 out vec3 vColor;
 out float vSize;
+out vec3 vWorldPos;
 
 uniform mat4 model;
 uniform mat4 view;
@@ -32,8 +33,49 @@ uniform float globalScale;
 void main() {
     vColor = color;
     vSize = size * globalScale;
-    gl_Position = view * model * vec4(position, 1.0);
-    gl_PointSize = vSize * 500.0 / gl_Position.z;
+    vec4 worldPos = model * vec4(position, 1.0);
+    vWorldPos = worldPos.xyz;
+    gl_Position = projection * view * worldPos;
+}
+"""
+
+# Geometry Shader pour transformer les points en billboards
+PARTICLE_GEOMETRY_SHADER = """
+#version 330 core
+
+layout(points) in;
+layout(triangle_strip, max_vertices = 4) out;
+
+in vec3 vColor[];
+in float vSize[];
+in vec3 vWorldPos[];
+
+out vec3 gColor;
+out vec2 gUV;
+
+uniform mat4 view;
+uniform mat4 projection;
+uniform vec3 cameraRight;
+uniform vec3 cameraUp;
+
+void emitCorner(vec2 corner, vec2 uv) {
+    float halfSize = vSize[0] * 0.5;
+    vec3 offset = cameraRight * (corner.x * halfSize) +
+                 cameraUp * (corner.y * halfSize);
+    vec3 worldPos = vWorldPos[0] + offset;
+    vec4 viewPos = view * vec4(worldPos, 1.0);
+    gl_Position = projection * viewPos;
+    gColor = vColor[0];
+    gUV = uv;
+    EmitVertex();
+}
+
+void main() {
+    emitCorner(vec2(-1.0, -1.0), vec2(0.0, 0.0));
+    emitCorner(vec2(1.0, -1.0), vec2(1.0, 0.0));
+    emitCorner(vec2(-1.0, 1.0), vec2(0.0, 1.0));
+    emitCorner(vec2(1.0, 1.0), vec2(1.0, 1.0));
+    EndPrimitive();
 }
 """
 
@@ -41,8 +83,8 @@ void main() {
 PARTICLE_FRAGMENT_SHADER = """
 #version 330 core
 
-in vec3 vColor;
-in float vSize;
+in vec3 gColor;
+in vec2 gUV;
 
 out vec4 FragColor;
 
@@ -53,8 +95,8 @@ uniform vec3 viewPos;
 uniform int shadingMode;  // 0: flat, 1: sphere, 2: glow
 
 void main() {
-    // Calcule la normale de la "sphère" à partir des coordonnées du point
-    vec2 coord = gl_PointCoord * 2.0 - 1.0;
+    // Calcule la normale de la "sphère" à partir des coordonnées interpolées
+    vec2 coord = gUV * 2.0 - 1.0;
     float dist = dot(coord, coord);
     
     if (dist > 1.0) {
@@ -79,14 +121,14 @@ void main() {
     
     if (shadingMode == 0) {
         // Mode plat
-        result = vColor;
+        result = gColor;
     } else if (shadingMode == 1) {
         // Mode sphère avec éclairage
-        result = (ambient + diffuse + specular) * vColor;
+        result = (ambient + diffuse + specular) * gColor;
     } else {
         // Mode glow
         float glow = 1.0 - sqrt(dist);
-        result = vColor * (0.5 + glow * 0.5);
+        result = gColor * (0.5 + glow * 0.5);
         result += vec3(glow * 0.2);
     }
     
@@ -175,7 +217,7 @@ void main() {
 
 class Camera:
     """Caméra 3D avec orbite autour d'un point"""
-    
+
     def __init__(self):
         self.target = np.array([0.0, 10.0, 0.0], dtype=np.float32)
         self.distance = 60.0
@@ -185,18 +227,18 @@ class Camera:
         self.near = 0.1
         self.far = 500.0
         self.aspect = 1.0
-        
+
     def get_position(self) -> np.ndarray:
         """Calcule la position de la caméra"""
         pitch_rad = np.radians(self.pitch)
         yaw_rad = np.radians(self.yaw)
-        
+
         x = self.distance * np.cos(pitch_rad) * np.sin(yaw_rad)
         y = self.distance * np.sin(-pitch_rad)
         z = self.distance * np.cos(pitch_rad) * np.cos(yaw_rad)
-        
+
         return self.target + np.array([x, y, z], dtype=np.float32)
-    
+
     def get_view_matrix(self) -> np.ndarray:
         """Retourne la matrice de vue"""
         position = self.get_position()
@@ -205,38 +247,66 @@ class Camera:
             self.target,
             np.array([0.0, 1.0, 0.0], dtype=np.float32)
         )
-    
+
     def get_projection_matrix(self) -> np.ndarray:
         """Retourne la matrice de projection"""
         return pyrr.matrix44.create_perspective_projection(
             self.fov, self.aspect, self.near, self.far
         )
-    
+
+    def get_basis_vectors(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Retourne les vecteurs right/up de la caméra"""
+        position = self.get_position()
+        forward = self.target - position
+        norm = np.linalg.norm(forward)
+        if norm < 1e-6:
+            forward = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+        else:
+            forward = forward / norm
+
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        right = np.cross(forward, world_up)
+        right_norm = np.linalg.norm(right)
+        if right_norm < 1e-6:
+            right = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            right = right / right_norm
+
+        up = np.cross(right, forward)
+        up_norm = np.linalg.norm(up)
+        if up_norm < 1e-6:
+            up = world_up
+        else:
+            up = up / up_norm
+
+        return right.astype(np.float32), up.astype(np.float32)
+
     def orbit(self, dx: float, dy: float):
         """Orbite la caméra autour du point cible"""
         self.yaw += dx * 0.5
         self.pitch += dy * 0.5
         self.pitch = np.clip(self.pitch, -89.0, 89.0)
-        
+
     def zoom(self, delta: float):
         """Zoom avant/arrière"""
         self.distance *= (1.0 - delta * 0.1)
         self.distance = np.clip(self.distance, 5.0, 200.0)
-        
+
     def pan(self, dx: float, dy: float):
         """Déplace le point cible"""
         # Calcule les vecteurs right et up de la caméra
         yaw_rad = np.radians(self.yaw)
-        right = np.array([np.cos(yaw_rad), 0.0, -np.sin(yaw_rad)], dtype=np.float32)
+        right = np.array(
+            [np.cos(yaw_rad), 0.0, -np.sin(yaw_rad)], dtype=np.float32)
         up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        
+
         self.target += right * dx * 0.1
         self.target += up * dy * 0.1
 
 
 class Renderer:
     """Gestionnaire de rendu OpenGL"""
-    
+
     def __init__(self):
         self.particle_shader = None
         self.grid_shader = None
@@ -250,9 +320,9 @@ class Renderer:
         self.box_vao = None
         self.box_vbo = None
         self.box_ebo = None
-        
+
         self.camera = Camera()
-        
+
         # Paramètres de rendu
         self.light_dir = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         self.light_color = np.array([1.0, 1.0, 0.95], dtype=np.float32)
@@ -265,13 +335,13 @@ class Renderer:
         self.show_grid = True
         self.show_bounds = True
         self.particle_count = 0
-        
+
         # Limites du monde
         self.bounds = np.array([
             [-25, 0, -25],
             [25, 50, 25]
         ], dtype=np.float32)
-        
+
     def initialize(self):
         """Initialise OpenGL et les shaders"""
         # Active les fonctionnalités nécessaires
@@ -279,57 +349,64 @@ class Renderer:
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glEnable(GL_PROGRAM_POINT_SIZE)
-        
+
         # Compile les shaders
         self._compile_shaders()
-        
+
         # Crée les VAOs/VBOs
         self._create_particle_buffers()
         self._create_grid_buffers()
         self._create_box_buffers()
-        
+
     def _compile_shaders(self):
         """Compile tous les shaders"""
         # Shader pour les particules
-        vertex = shaders.compileShader(PARTICLE_VERTEX_SHADER, GL_VERTEX_SHADER)
-        fragment = shaders.compileShader(PARTICLE_FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
-        self.particle_shader = shaders.compileProgram(vertex, fragment)
-        
+        vertex = shaders.compileShader(
+            PARTICLE_VERTEX_SHADER, GL_VERTEX_SHADER)
+        geometry = shaders.compileShader(
+            PARTICLE_GEOMETRY_SHADER, GL_GEOMETRY_SHADER)
+        fragment = shaders.compileShader(
+            PARTICLE_FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
+        self.particle_shader = shaders.compileProgram(
+            vertex, geometry, fragment)
+
         # Shader pour la grille
         vertex = shaders.compileShader(GRID_VERTEX_SHADER, GL_VERTEX_SHADER)
-        fragment = shaders.compileShader(GRID_FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
+        fragment = shaders.compileShader(
+            GRID_FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
         self.grid_shader = shaders.compileProgram(vertex, fragment)
-        
+
         # Shader pour la boîte
         vertex = shaders.compileShader(BOX_VERTEX_SHADER, GL_VERTEX_SHADER)
-        fragment = shaders.compileShader(BOX_FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
+        fragment = shaders.compileShader(
+            BOX_FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
         self.box_shader = shaders.compileProgram(vertex, fragment)
-        
+
     def _create_particle_buffers(self):
         """Crée les buffers pour les particules"""
         self.particle_vao = glGenVertexArrays(1)
         glBindVertexArray(self.particle_vao)
-        
+
         # Buffer des positions
         self.particle_vbo_pos = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.particle_vbo_pos)
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(0)
-        
+
         # Buffer des couleurs
         self.particle_vbo_color = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.particle_vbo_color)
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(1)
-        
+
         # Buffer des tailles
         self.particle_vbo_size = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.particle_vbo_size)
         glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(2)
-        
+
         glBindVertexArray(0)
-        
+
     def _create_grid_buffers(self):
         """Crée les buffers pour la grille au sol"""
         # Crée un grand quad pour le sol
@@ -342,23 +419,24 @@ class Renderer:
             grid_size, 0.0, grid_size,
             -grid_size, 0.0, grid_size,
         ], dtype=np.float32)
-        
+
         self.grid_vao = glGenVertexArrays(1)
         glBindVertexArray(self.grid_vao)
-        
+
         self.grid_vbo = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.grid_vbo)
-        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes,
+                     vertices, GL_STATIC_DRAW)
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(0)
-        
+
         glBindVertexArray(0)
-        
+
     def _create_box_buffers(self):
         """Crée les buffers pour la boîte de limites"""
         min_b = self.bounds[0]
         max_b = self.bounds[1]
-        
+
         # Les 8 sommets de la boîte
         vertices = np.array([
             min_b[0], min_b[1], min_b[2],  # 0
@@ -370,7 +448,7 @@ class Renderer:
             max_b[0], max_b[1], max_b[2],  # 6
             min_b[0], max_b[1], max_b[2],  # 7
         ], dtype=np.float32)
-        
+
         # Indices pour les lignes
         indices = np.array([
             # Face avant
@@ -380,142 +458,150 @@ class Renderer:
             # Connexions
             0, 4, 1, 5, 2, 6, 3, 7,
         ], dtype=np.uint32)
-        
+
         self.box_vao = glGenVertexArrays(1)
         glBindVertexArray(self.box_vao)
-        
+
         self.box_vbo = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.box_vbo)
-        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes,
+                     vertices, GL_STATIC_DRAW)
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(0)
-        
+
         self.box_ebo = glGenBuffers(1)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.box_ebo)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
-        
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     indices.nbytes, indices, GL_STATIC_DRAW)
+
         glBindVertexArray(0)
-        
+
     def update_particles(self, positions: np.ndarray, colors: np.ndarray, sizes: np.ndarray):
         """Met à jour les données des particules"""
         self.particle_count = len(sizes)
-        
+
         if self.particle_count == 0:
             return
-            
+
         glBindVertexArray(self.particle_vao)
-        
+
         # Met à jour les positions
         glBindBuffer(GL_ARRAY_BUFFER, self.particle_vbo_pos)
-        glBufferData(GL_ARRAY_BUFFER, positions.nbytes, positions, GL_DYNAMIC_DRAW)
-        
+        glBufferData(GL_ARRAY_BUFFER, positions.nbytes,
+                     positions, GL_DYNAMIC_DRAW)
+
         # Met à jour les couleurs
         glBindBuffer(GL_ARRAY_BUFFER, self.particle_vbo_color)
         glBufferData(GL_ARRAY_BUFFER, colors.nbytes, colors, GL_DYNAMIC_DRAW)
-        
+
         # Met à jour les tailles
         glBindBuffer(GL_ARRAY_BUFFER, self.particle_vbo_size)
         glBufferData(GL_ARRAY_BUFFER, sizes.nbytes, sizes, GL_DYNAMIC_DRAW)
-        
+
         glBindVertexArray(0)
-        
+
     def render(self, width: int, height: int):
         """Effectue le rendu de la scène"""
         self.camera.aspect = width / height if height > 0 else 1.0
-        
+
         # Clear
         glClearColor(*self.background_color, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        
+
         # Matrices
-        view = self.camera.get_view_matrix()
-        projection = self.camera.get_projection_matrix()
+        view = self.camera.get_view_matrix().astype(np.float32)
+        projection = self.camera.get_projection_matrix().astype(np.float32)
         model = pyrr.matrix44.create_identity(dtype=np.float32)
-        
+
         # Rend la grille
         if self.show_grid:
             self._render_grid(model, view, projection)
-        
+
         # Rend les limites
         if self.show_bounds:
             self._render_box(model, view, projection)
-        
+
         # Rend les particules
         self._render_particles(model, view, projection)
-        
+
     def _render_particles(self, model, view, projection):
         """Rend les particules"""
         if self.particle_count == 0:
             return
-            
+
         glUseProgram(self.particle_shader)
-        
+
         # Uniforms
-        glUniformMatrix4fv(glGetUniformLocation(self.particle_shader, "model"), 
-                         1, GL_FALSE, model)
-        glUniformMatrix4fv(glGetUniformLocation(self.particle_shader, "view"), 
-                         1, GL_FALSE, view)
-        glUniformMatrix4fv(glGetUniformLocation(self.particle_shader, "projection"), 
-                         1, GL_FALSE, projection)
-        glUniform3fv(glGetUniformLocation(self.particle_shader, "lightDir"), 
-                    1, self.light_dir)
-        glUniform3fv(glGetUniformLocation(self.particle_shader, "lightColor"), 
-                    1, self.light_color)
-        glUniform1f(glGetUniformLocation(self.particle_shader, "ambientStrength"), 
-                   self.ambient_strength)
-        glUniform3fv(glGetUniformLocation(self.particle_shader, "viewPos"), 
-                    1, self.camera.get_position())
-        glUniform1f(glGetUniformLocation(self.particle_shader, "globalScale"), 
-                   self.global_particle_scale)
-        glUniform1i(glGetUniformLocation(self.particle_shader, "shadingMode"), 
-                   self.shading_mode)
-        
+        glUniformMatrix4fv(glGetUniformLocation(self.particle_shader, "model"),
+                           1, GL_FALSE, model)
+        glUniformMatrix4fv(glGetUniformLocation(self.particle_shader, "view"),
+                           1, GL_FALSE, view)
+        glUniformMatrix4fv(glGetUniformLocation(self.particle_shader, "projection"),
+                           1, GL_FALSE, projection)
+        cam_right, cam_up = self.camera.get_basis_vectors()
+        glUniform3fv(glGetUniformLocation(self.particle_shader, "cameraRight"),
+                     1, cam_right)
+        glUniform3fv(glGetUniformLocation(self.particle_shader, "cameraUp"),
+                     1, cam_up)
+        glUniform3fv(glGetUniformLocation(self.particle_shader, "lightDir"),
+                     1, self.light_dir)
+        glUniform3fv(glGetUniformLocation(self.particle_shader, "lightColor"),
+                     1, self.light_color)
+        glUniform1f(glGetUniformLocation(self.particle_shader, "ambientStrength"),
+                    self.ambient_strength)
+        glUniform3fv(glGetUniformLocation(self.particle_shader, "viewPos"),
+                     1, self.camera.get_position())
+        glUniform1f(glGetUniformLocation(self.particle_shader, "globalScale"),
+                    self.global_particle_scale)
+        glUniform1i(glGetUniformLocation(self.particle_shader, "shadingMode"),
+                    self.shading_mode)
+
         glBindVertexArray(self.particle_vao)
         glDrawArrays(GL_POINTS, 0, self.particle_count)
         glBindVertexArray(0)
-        
+
     def _render_grid(self, model, view, projection):
         """Rend la grille au sol"""
         glUseProgram(self.grid_shader)
-        
-        glUniformMatrix4fv(glGetUniformLocation(self.grid_shader, "model"), 
-                         1, GL_FALSE, model)
-        glUniformMatrix4fv(glGetUniformLocation(self.grid_shader, "view"), 
-                         1, GL_FALSE, view)
-        glUniformMatrix4fv(glGetUniformLocation(self.grid_shader, "projection"), 
-                         1, GL_FALSE, projection)
-        glUniform3fv(glGetUniformLocation(self.grid_shader, "gridColor"), 
-                    1, self.grid_color)
+
+        glUniformMatrix4fv(glGetUniformLocation(self.grid_shader, "model"),
+                           1, GL_FALSE, model)
+        glUniformMatrix4fv(glGetUniformLocation(self.grid_shader, "view"),
+                           1, GL_FALSE, view)
+        glUniformMatrix4fv(glGetUniformLocation(self.grid_shader, "projection"),
+                           1, GL_FALSE, projection)
+        glUniform3fv(glGetUniformLocation(self.grid_shader, "gridColor"),
+                     1, self.grid_color)
         glUniform1f(glGetUniformLocation(self.grid_shader, "gridSize"), 2.0)
-        
+
         glBindVertexArray(self.grid_vao)
         glDrawArrays(GL_TRIANGLES, 0, 6)
         glBindVertexArray(0)
-        
+
     def _render_box(self, model, view, projection):
         """Rend la boîte de limites"""
         glUseProgram(self.box_shader)
-        
-        glUniformMatrix4fv(glGetUniformLocation(self.box_shader, "model"), 
-                         1, GL_FALSE, model)
-        glUniformMatrix4fv(glGetUniformLocation(self.box_shader, "view"), 
-                         1, GL_FALSE, view)
-        glUniformMatrix4fv(glGetUniformLocation(self.box_shader, "projection"), 
-                         1, GL_FALSE, projection)
-        glUniform3fv(glGetUniformLocation(self.box_shader, "boxColor"), 
-                    1, self.box_color)
+
+        glUniformMatrix4fv(glGetUniformLocation(self.box_shader, "model"),
+                           1, GL_FALSE, model)
+        glUniformMatrix4fv(glGetUniformLocation(self.box_shader, "view"),
+                           1, GL_FALSE, view)
+        glUniformMatrix4fv(glGetUniformLocation(self.box_shader, "projection"),
+                           1, GL_FALSE, projection)
+        glUniform3fv(glGetUniformLocation(self.box_shader, "boxColor"),
+                     1, self.box_color)
         glUniform1f(glGetUniformLocation(self.box_shader, "alpha"), 0.5)
-        
+
         glLineWidth(2.0)
         glBindVertexArray(self.box_vao)
         glDrawElements(GL_LINES, 24, GL_UNSIGNED_INT, None)
         glBindVertexArray(0)
-        
+
     def set_bounds(self, bounds: np.ndarray):
         """Met à jour les limites du monde"""
         self.bounds = bounds
         self._create_box_buffers()
-        
+
     def cleanup(self):
         """Nettoie les ressources OpenGL"""
         if self.particle_vao:
