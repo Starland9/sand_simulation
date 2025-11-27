@@ -4,3 +4,4 @@ PyQt6>=6.5.0
 PyOpenGL>=3.1.7
 PyOpenGL-accelerate>=3.1.7
 pyrr>=0.10.3
+PyInstaller>=6.17.0

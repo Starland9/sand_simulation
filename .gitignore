@@ -1,2 +1,7 @@
 .venv
 *.pyc
+build/
+dist/
+__pycache__/
+.env
+.DS_Store
